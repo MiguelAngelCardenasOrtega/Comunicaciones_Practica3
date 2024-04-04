@@ -5,11 +5,29 @@ dependencies:
       service_url: https://api.components.espressif.com/
       type: service
     version: 4.3.4~1
+  espressif/led_strip:
+    component_hash: 67d2744208e9c12d8b1992d21c979396c1726e57cb7e35e7c171c515be20f8ea
+    source:
+      service_url: https://api.components.espressif.com/
+      type: service
+    version: 2.5.3
+  espressif/mdns:
+    component_hash: d8ae7aa491ff97aea1d00d514a1de42cdbaaf1bce10df183968fa5594b904de7
+    source:
+      service_url: https://api.components.espressif.com/
+      type: service
+    version: 1.2.5
   idf:
     component_hash: null
     source:
       type: idf
     version: 5.2.0
-manifest_hash: f5fde5bad24c54d2b34d9f7413dfac931ca94c09d0c81f6243b8f67c63f9decc
+  protocol_examples_common:
+    component_hash: null
+    source:
+      path: C:\Users\mcardenas\esp\v5.2\esp-idf\examples\common_components\protocol_examples_common
+      type: local
+    version: '*'
+manifest_hash: 9c4d289fc84c59eed556acce4ff2220937245ecafcfd4d36d15eae03ddc1157a
 target: esp32s3
 version: 1.0.0

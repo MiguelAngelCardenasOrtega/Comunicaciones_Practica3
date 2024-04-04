@@ -31,6 +31,11 @@
 
 #include "coap3/coap.h"
 
+#include "driver/gpio.h"
+#include "led_strip.h"
+
+#include "mdns.h"
+
 #ifndef CONFIG_COAP_SERVER_SUPPORT
 #error COAP_SERVER_SUPPORT needs to be enabled
 #endif /* COAP_SERVER_SUPPORT */
@@ -58,11 +63,61 @@
    by 'idf.py menuconfig' to reduce code size.
 */
 #define EXAMPLE_COAP_LOG_DEFAULT_LEVEL CONFIG_COAP_LOG_DEFAULT_LEVEL
-
 const static char *TAG = "CoAP_server";
 
-static char espressif_data[100];
-static int espressif_data_len = 0;
+#define EXAMPLE_MDNS_INSTANCE CONFIG_MDNS_INSTANCE
+
+#define DEFAULT_NAME "No name"
+#define UNTIE_SHOELACE "untie"
+#define TIE_SHOELACE   "tie"
+#define DEFAULT_SHOELACE UNTIE_SHOELACE
+#define DEFAULT_LED     "000000"
+
+static char shoelace_data[6] = DEFAULT_SHOELACE;
+static char led_data[7] = DEFAULT_LED;
+static char size_data[3] = {"26"};
+static char name_data[21] = DEFAULT_NAME;
+static uint32_t steps_count = 0;
+
+#define BLINK_GPIO CONFIG_BLINK_GPIO
+static led_strip_handle_t led_strip;
+
+static void update_led_color(void)
+{
+    uint32_t rgb_levels = strtol(led_data, NULL, 16);
+    
+    uint8_t red_level = (rgb_levels & 0xFF0000) >> 16;
+    uint8_t green_level = (rgb_levels & 0x00FF00) >> 8;
+    uint8_t blue_level = (rgb_levels & 0x0000FF);
+    
+    /* If the addressable LED is enabled */
+    if (strcmp(led_data, DEFAULT_LED) == 0) {
+        /* Set all LED off to clear all pixels */
+        led_strip_clear(led_strip);
+    } else {
+        /* Set the LED pixel using RGB from 0 (0%) to 255 (100%) for each color */
+        led_strip_set_pixel(led_strip, 0, red_level, green_level, blue_level);
+        /* Refresh the strip to send data */
+        led_strip_refresh(led_strip);
+    }
+}
+
+static void configure_led(void)
+{
+    ESP_LOGI(TAG, "Example configured to blink addressable LED!");
+    /* LED strip initialization with the GPIO and pixels number*/
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = BLINK_GPIO,
+        .max_leds = 1, // at least one LED on board
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz
+        .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    /* Set all LED off to clear all pixels */
+    led_strip_clear(led_strip);
+}
 
 #ifdef CONFIG_COAP_MBEDTLS_PKI
 /* CA cert, taken from coap_ca.pem
@@ -90,13 +145,11 @@ extern uint8_t oscore_conf_start[] asm("_binary_coap_oscore_conf_start");
 extern uint8_t oscore_conf_end[]   asm("_binary_coap_oscore_conf_end");
 #endif /* CONFIG_COAP_OSCORE_SUPPORT */
 
-#define INITIAL_DATA "Hello World!"
-
 /*
- * The resource handler
+ * The resource handler for GET, PUT and DELETE requests for the shoe name resource
  */
 static void
-hnd_espressif_get(coap_resource_t *resource,
+shoe_name_get(coap_resource_t *resource,
                   coap_session_t *session,
                   const coap_pdu_t *request,
                   const coap_string_t *query,
@@ -105,13 +158,13 @@ hnd_espressif_get(coap_resource_t *resource,
     coap_pdu_set_code(response, COAP_RESPONSE_CODE_CONTENT);
     coap_add_data_large_response(resource, session, request, response,
                                  query, COAP_MEDIATYPE_TEXT_PLAIN, 60, 0,
-                                 (size_t)espressif_data_len,
-                                 (const u_char *)espressif_data,
+                                 (size_t)strlen(name_data),
+                                 (const u_char *)name_data,
                                  NULL, NULL);
 }
 
 static void
-hnd_espressif_put(coap_resource_t *resource,
+shoe_name_put(coap_resource_t *resource,
                   coap_session_t *session,
                   const coap_pdu_t *request,
                   const coap_string_t *query,
@@ -124,35 +177,249 @@ hnd_espressif_put(coap_resource_t *resource,
 
     coap_resource_notify_observers(resource, NULL);
 
-    if (strcmp (espressif_data, INITIAL_DATA) == 0) {
+    if (strcmp (name_data, DEFAULT_NAME) == 0) {
         coap_pdu_set_code(response, COAP_RESPONSE_CODE_CREATED);
     } else {
         coap_pdu_set_code(response, COAP_RESPONSE_CODE_CHANGED);
     }
 
-    /* coap_get_data_large() sets size to 0 on error */
+    // coap_get_data_large() sets size to 0 on error
     (void)coap_get_data_large(request, &size, &data, &offset, &total);
 
-    if (size == 0) {      /* re-init */
-        snprintf(espressif_data, sizeof(espressif_data), INITIAL_DATA);
-        espressif_data_len = strlen(espressif_data);
+    if (size == 0) {      // re-init
+        snprintf(name_data, sizeof(name_data), DEFAULT_NAME);
     } else {
-        espressif_data_len = size > sizeof (espressif_data) ? sizeof (espressif_data) : size;
-        memcpy (espressif_data, data, espressif_data_len);
+        size = size > sizeof (name_data) ? sizeof (name_data) : size;
+        memset (name_data, 0, sizeof(name_data));
+        memcpy (name_data, data, size);
     }
+
+    ESP_LOGI(TAG,"CUSTOM SHOE APP: Set a new name for the shoes: %s\r\n", name_data);
 }
 
 static void
-hnd_espressif_delete(coap_resource_t *resource,
-                     coap_session_t *session,
-                     const coap_pdu_t *request,
-                     const coap_string_t *query,
-                     coap_pdu_t *response)
+shoe_name_delete(coap_resource_t *resource,
+                 coap_session_t *session,
+                 const coap_pdu_t *request,
+                 const coap_string_t *query,
+                 coap_pdu_t *response)
 {
     coap_resource_notify_observers(resource, NULL);
-    snprintf(espressif_data, sizeof(espressif_data), INITIAL_DATA);
-    espressif_data_len = strlen(espressif_data);
+    snprintf(name_data, sizeof(name_data), DEFAULT_NAME);
     coap_pdu_set_code(response, COAP_RESPONSE_CODE_DELETED);
+}
+
+/*
+ * The resource handler for GET and PUT requests for the shoelace resource
+ */
+static void
+shoelace_get(coap_resource_t *resource,
+                  coap_session_t *session,
+                  const coap_pdu_t *request,
+                  const coap_string_t *query,
+                  coap_pdu_t *response)
+{
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_CONTENT);
+    coap_add_data_large_response(resource, session, request, response,
+                                 query, COAP_MEDIATYPE_TEXT_PLAIN, 60, 0,
+                                 (size_t)strlen(shoelace_data),
+                                 (const u_char *)shoelace_data,
+                                 NULL, NULL);
+}
+
+static void
+shoelace_put(coap_resource_t *resource,
+                  coap_session_t *session,
+                  const coap_pdu_t *request,
+                  const coap_string_t *query,
+                  coap_pdu_t *response)
+{
+    size_t size;
+    size_t offset;
+    size_t total;
+    const char *data;
+
+    coap_resource_notify_observers(resource, NULL);
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_CHANGED);
+
+    // coap_get_data_large() sets size to 0 on error
+    (void)coap_get_data_large(request, &size, &data, &offset, &total);
+
+    if (size == 0) {      // re-init
+        snprintf(shoelace_data, sizeof(shoelace_data), DEFAULT_SHOELACE);
+    } else {
+        if (strncmp (data, TIE_SHOELACE, sizeof(TIE_SHOELACE)-1) == 0)
+        {
+            snprintf(shoelace_data, sizeof(shoelace_data), TIE_SHOELACE);
+            ESP_LOGI(TAG,"CUSTOM SHOE APP: Tying the shoes...\r\n");
+        }
+        else if (strncmp (data, UNTIE_SHOELACE, sizeof(UNTIE_SHOELACE)-1) == 0)
+        {
+            snprintf(shoelace_data, sizeof(shoelace_data), UNTIE_SHOELACE);
+            ESP_LOGI(TAG,"CUSTOM SHOE APP: Untying the shoes...\r\n");
+        }
+        else{
+            ESP_LOGI(TAG,"CUSTOM SHOE APP: Error! Invalid shoelace command!\r\n");
+        }
+    }
+}
+
+/*
+ * The resource handler for GET, PUT and DELETE requests for the shoe LED resource
+ */
+static void
+shoe_led_get(coap_resource_t *resource,
+                  coap_session_t *session,
+                  const coap_pdu_t *request,
+                  const coap_string_t *query,
+                  coap_pdu_t *response)
+{
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_CONTENT);
+    coap_add_data_large_response(resource, session, request, response,
+                                 query, COAP_MEDIATYPE_TEXT_PLAIN, 60, 0,
+                                 (size_t)strlen(led_data),
+                                 (const u_char *)led_data,
+                                 NULL, NULL);
+}
+
+static void
+shoe_led_put(coap_resource_t *resource,
+                  coap_session_t *session,
+                  const coap_pdu_t *request,
+                  const coap_string_t *query,
+                  coap_pdu_t *response)
+{
+    size_t size;
+    size_t offset;
+    size_t total;
+    const unsigned char *data;
+
+    coap_resource_notify_observers(resource, NULL);
+
+    if (strcmp (led_data, DEFAULT_LED) == 0) {
+        coap_pdu_set_code(response, COAP_RESPONSE_CODE_CREATED);
+    } else {
+        coap_pdu_set_code(response, COAP_RESPONSE_CODE_CHANGED);
+    }
+
+    // coap_get_data_large() sets size to 0 on error
+    (void)coap_get_data_large(request, &size, &data, &offset, &total);
+
+    if (size != 6) {      // re-init
+        snprintf(led_data, sizeof(led_data), DEFAULT_LED);
+    } else {
+        memcpy (led_data, data, size);
+    }
+    
+    update_led_color();
+
+    ESP_LOGI(TAG,"CUSTOM SHOE APP: Updating LED color to: %s\r\n", led_data);
+}
+
+static void
+shoe_led_delete(coap_resource_t *resource,
+                 coap_session_t *session,
+                 const coap_pdu_t *request,
+                 const coap_string_t *query,
+                 coap_pdu_t *response)
+{
+    coap_resource_notify_observers(resource, NULL);
+    snprintf(led_data, sizeof(led_data), DEFAULT_LED);
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_DELETED);
+
+    update_led_color();
+    ESP_LOGI(TAG,"CUSTOM SHOE APP: Turning off LED...\r\n");
+}
+
+/*
+ * The resource handler for GET and DELETE requests for the shoe steps resource
+ */
+static void
+shoe_steps_get(coap_resource_t *resource,
+                  coap_session_t *session,
+                  const coap_pdu_t *request,
+                  const coap_string_t *query,
+                  coap_pdu_t *response)
+{
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_CONTENT);
+
+    char steps_count_str[7] = {0};
+    snprintf(steps_count_str, sizeof(steps_count_str), "%lu", steps_count);
+
+    coap_add_data_large_response(resource, session, request, response,
+                                 query, COAP_MEDIATYPE_TEXT_PLAIN, 60, 0,
+                                 (size_t)strlen(steps_count_str),
+                                 (const u_char *)steps_count_str,
+                                 NULL, NULL);
+}
+
+static void
+shoe_steps_delete(coap_resource_t *resource,
+                 coap_session_t *session,
+                 const coap_pdu_t *request,
+                 const coap_string_t *query,
+                 coap_pdu_t *response)
+{
+    coap_resource_notify_observers(resource, NULL);
+    steps_count = 0;
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_DELETED);
+
+    ESP_LOGI(TAG,"CUSTOM SHOE APP: Resetting the step count...\r\n");
+}
+
+/*
+ * The resource handler for GET requests for the shoe size resource
+ */
+static void
+shoe_size_get(coap_resource_t *resource,
+                  coap_session_t *session,
+                  const coap_pdu_t *request,
+                  const coap_string_t *query,
+                  coap_pdu_t *response)
+{
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_CONTENT);
+
+    coap_add_data_large_response(resource, session, request, response,
+                                 query, COAP_MEDIATYPE_TEXT_PLAIN, 60, 0,
+                                 (size_t)strlen(size_data),
+                                 (const u_char *)size_data,
+                                 NULL, NULL);
+}
+
+/** Generate host name based on sdkconfig, optionally adding a portion of MAC address to it.
+ *  @return host name string allocated from the heap
+ */
+static char *generate_hostname(void)
+{
+#ifndef CONFIG_MDNS_ADD_MAC_TO_HOSTNAME
+    return strdup(CONFIG_MDNS_HOSTNAME);
+#else
+    uint8_t mac[6];
+    char   *hostname;
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (-1 == asprintf(&hostname, "%s-%02X%02X%02X", CONFIG_MDNS_HOSTNAME, mac[3], mac[4], mac[5])) {
+        abort();
+    }
+    return hostname;
+#endif
+}
+
+static void initialise_mdns(void)
+{
+    char *hostname = generate_hostname();
+
+    //initialize mDNS
+    ESP_ERROR_CHECK( mdns_init() );
+    //set mDNS hostname (required if you want to advertise services)
+    ESP_ERROR_CHECK( mdns_hostname_set(hostname) );
+    ESP_LOGI(TAG, "mdns hostname set to: [%s]", hostname);
+    //set default mDNS instance name
+    ESP_ERROR_CHECK( mdns_instance_name_set(EXAMPLE_MDNS_INSTANCE) );
+
+    //initialize service
+    ESP_ERROR_CHECK( mdns_service_add("shoe_control", "_coap", "_udp", 5683, NULL, 0));
+
+    free(hostname);
 }
 
 #ifdef CONFIG_COAP_OSCORE_SUPPORT
@@ -189,6 +456,11 @@ verify_cn_callback(const char *cn,
     return 1;
 }
 #endif /* CONFIG_COAP_MBEDTLS_PKI */
+
+void steps_timer_callback( TimerHandle_t xTimer )
+{
+    steps_count++;
+}
 
 static void
 coap_log_handler (coap_log_t level, const char *message)
@@ -235,11 +507,21 @@ static void coap_example_server(void *p)
     coap_oscore_conf_t *oscore_conf;
 #endif /* CONFIG_COAP_OSCORE_SUPPORT */
 
+    /* Configure the RGB LED state */
+    configure_led();
+    update_led_color();
+
+    //Initiliaze the mDNS service
+    initialise_mdns();
+
+    /* Create timer to simulate steps*/
+    TimerHandle_t steps_timer;
+    steps_timer = xTimerCreate("Steps Timer", pdMS_TO_TICKS(1000), pdTRUE, 0, steps_timer_callback);
+    xTimerStart(steps_timer, 0);
+
     /* Initialize libcoap library */
     coap_startup();
 
-    snprintf(espressif_data, sizeof(espressif_data), INITIAL_DATA);
-    espressif_data_len = strlen(espressif_data);
     coap_set_log_handler(coap_log_handler);
     coap_set_log_level(EXAMPLE_COAP_LOG_DEFAULT_LEVEL);
 
@@ -368,17 +650,67 @@ static void coap_example_server(void *p)
             goto clean_up;
         }
 
-        resource = coap_resource_init(coap_make_str_const("Espressif"), 0);
+        //Add the shoe name resource
+        resource = coap_resource_init(coap_make_str_const("shoe/name"), 0);
         if (!resource) {
             ESP_LOGE(TAG, "coap_resource_init() failed");
             goto clean_up;
         }
-        coap_register_handler(resource, COAP_REQUEST_GET, hnd_espressif_get);
-        coap_register_handler(resource, COAP_REQUEST_PUT, hnd_espressif_put);
-        coap_register_handler(resource, COAP_REQUEST_DELETE, hnd_espressif_delete);
+        coap_register_handler(resource, COAP_REQUEST_GET, shoe_name_get);
+        coap_register_handler(resource, COAP_REQUEST_PUT, shoe_name_put);
+        coap_register_handler(resource, COAP_REQUEST_DELETE, shoe_name_delete);
         /* We possibly want to Observe the GETs */
         coap_resource_set_get_observable(resource, 1);
         coap_add_resource(ctx, resource);
+
+        //Add the shoelace resource
+        resource = coap_resource_init(coap_make_str_const("shoe/shoelace"), 0);
+        if (!resource) {
+            ESP_LOGE(TAG, "coap_resource_init() failed");
+            goto clean_up;
+        }
+        coap_register_handler(resource, COAP_REQUEST_GET, shoelace_get);
+        coap_register_handler(resource, COAP_REQUEST_PUT, shoelace_put);
+        /* We possibly want to Observe the GETs */
+        coap_resource_set_get_observable(resource, 1);
+        coap_add_resource(ctx, resource);
+
+        //Add the shoe LED resource
+        resource = coap_resource_init(coap_make_str_const("shoe/ledcolor"), 0);
+        if (!resource) {
+            ESP_LOGE(TAG, "coap_resource_init() failed");
+            goto clean_up;
+        }
+        coap_register_handler(resource, COAP_REQUEST_GET, shoe_led_get);
+        coap_register_handler(resource, COAP_REQUEST_PUT, shoe_led_put);
+        coap_register_handler(resource, COAP_REQUEST_DELETE, shoe_led_delete);
+        /* We possibly want to Observe the GETs */
+        coap_resource_set_get_observable(resource, 1);
+        coap_add_resource(ctx, resource);
+
+        //Add the shoe steps resource
+        resource = coap_resource_init(coap_make_str_const("shoe/steps"), 0);
+        if (!resource) {
+            ESP_LOGE(TAG, "coap_resource_init() failed");
+            goto clean_up;
+        }
+        coap_register_handler(resource, COAP_REQUEST_GET, shoe_steps_get);
+        coap_register_handler(resource, COAP_REQUEST_DELETE, shoe_steps_delete);
+        /* We possibly want to Observe the GETs */
+        coap_resource_set_get_observable(resource, 1);
+        coap_add_resource(ctx, resource);
+
+        //Add the shoe size resource
+        resource = coap_resource_init(coap_make_str_const("shoe/size"), 0);
+        if (!resource) {
+            ESP_LOGE(TAG, "coap_resource_init() failed");
+            goto clean_up;
+        }
+        coap_register_handler(resource, COAP_REQUEST_GET, shoe_size_get);
+        /* We possibly want to Observe the GETs */
+        coap_resource_set_get_observable(resource, 1);
+        coap_add_resource(ctx, resource);
+
 #ifdef CONFIG_COAP_OSCORE_SUPPORT
         resource = coap_resource_init(coap_make_str_const("oscore"), COAP_RESOURCE_FLAGS_OSCORE_ONLY);
         if (!resource) {
